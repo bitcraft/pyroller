@@ -1,11 +1,14 @@
 from collections import OrderedDict
-from importlib import import_module
 import os
 import json
+from functools import partial
+import importlib
+import inspect
 import pygame as pg
-from data.components.casino_player import CasinoPlayer
-from . import prepare
 
+from data.components.casino_player import CasinoPlayer
+from data.state import State
+from . import prepare
 
 
 class Control(object):
@@ -14,6 +17,7 @@ class Control(object):
     the event_loop which passes events to States as needed. Logic for flipping
     states is also found here.
     """
+
     def __init__(self, caption, render_size, resolutions):
         self.screen = pg.display.get_surface()
         self.screen_rect = self.screen.get_rect()
@@ -45,18 +49,110 @@ class Control(object):
         """
         if scene_folder is None:
             scene_folder = os.path.join(".", "data", "states")
-        exclude_endings = (".py", ".pyc", "__pycache__")
-        for folder in os.listdir(scene_folder):
+
+        exclude_endings = ("__pycache__", scene_folder)
+        for folder, dirnames, filenames in os.walk(scene_folder):
             if any(folder.endswith(end) for end in exclude_endings):
                 continue
-            state = self.load_state_from_path(folder)
-            self.register_state(state, folder)
 
-    def register_state(self, state, folder):
-        if folder in self.state_dict:
-            print('Duplicate state detected: {}'.format(folder))
+            if '__init__.py' in filenames:
+                # name = 'data.states.' + os.path.basename(folder)
+                map(self.register_state, self.load_state_from_module(folder))
+            else:
+                joiner = partial(os.path.join, folder)
+                for filename in map(joiner, filenames):
+                    map(self.register_state, self.load_state_from_file(filename))
+
+        print(self.state_dict.values())
+
+    def register_state(self, state):
+        try:
+            name = state.name
+        except AttributeError:
+            print('state class {} is missing class attribute "name"'.format(state))
+            raise AttributeError
+
+        if name in self.state_dict:
+            print('Duplicate state detected: {}'.format(name))
             raise RuntimeError
-        self.state_dict[folder] = state
+
+        self.state_dict[name] = state
+
+    def load_state_from_module(self, path):
+        """ Load a state from module.  Return First state only.
+
+        :param path: file to load from
+        :return: State Class
+        """
+        import imp
+        name = 'mod'
+        print(path)
+        module = imp.load_module(path, None, path, ('py', 'r', imp.PKG_DIRECTORY))
+        # module = importlib.import_module(path)
+        states = self.get_states_from_module(module)
+        return states
+
+    def load_state_from_file(self, path):
+        """ Load a state from a python file.  Return the first state only.
+
+        :param path:
+        :return:
+        """
+        # module = import_module(package + folder)
+        name = 'mod'
+        with open(path) as fp:
+            module = importlib.machinery.SourceFileLoader(name, fp, path, ('py', 'r', imp.PY_SOURCE))
+            states = self.get_states_from_module(module)
+        return states
+
+    def get_states_from_module(self, module):
+        print('checking', module)
+        print(dir(module))
+        for name, obj in inspect.getmembers(module, inspect.isclass):
+            print(obj)
+
+        # for obj in (getattr(module, name) for name in dir(module)):
+        #     try:
+        #         if issubclass(obj, State):
+        #             print(obj)
+        #             return [obj]
+        #     except TypeError:
+        #         pass
+        return [None]
+
+    def query_all_states(self):
+        """ Return a dictionary of all registered states
+
+        Keys are state names, values are State classes
+
+        :return: dictionary of all loaded states
+        """
+        return self.state_dict.copy()
+
+    def start_state(self, state_name, persist=None):
+        """ Start a state
+
+        New stats will be created if there are none.
+
+        :param state_name: name of state to start
+        :param persist: dictionary of data for state
+        :return: None
+        """
+        if persist is None:
+            persist = self.create_new_persist()
+
+        try:
+            state = self.state_dict[state_name]
+        except KeyError:
+            print('Cannot find state: {}'.format(state_name))
+            raise RuntimeError
+
+        instance = state()
+        instance.controller = self
+        instance.startup(self.now, persist)
+
+        self.state = instance
+        self.state_name = state_name
 
     @property
     def saved_stats_are_available(self):
@@ -68,40 +164,6 @@ class Control(object):
         :return: bool
         """
         self._disk_stats_available = self.read_games_stats_from_disk() is not None
-
-    @staticmethod
-    def load_state_from_path(folder):
-        """ Load a state from disk, but do not register it
-
-        :param path: folder to load from
-        :return: Instanced state
-        """
-        # TODO: not hardcode package name
-        package = "data.states."
-        try:
-            scene_module = import_module(package + folder)
-            state = scene_module.Scene
-            return state
-        except Exception as e:
-            template = "{} failed to load or is not a valid game package"
-            print(e)
-            print(template.format(folder))
-            raise
-
-    @staticmethod
-    def read_games_stats_from_disk():
-        """ Load stats saved in JSON format
-
-        :return: stats dict
-        """
-        try:
-            path = os.path.join("resources", "save_game.json")
-            with open(path) as saved_file:
-                stats = json.load(saved_file)
-        except (IOError, ValueError):
-            stats = None
-
-        return stats
 
     def create_new_games_stats(self):
         """ Create new dict suitable for use when creating CasinoPlayer
@@ -118,6 +180,21 @@ class Control(object):
             if func:
                 game_stats = func()
                 stats[name] = game_stats
+
+        return stats
+
+    @staticmethod
+    def read_games_stats_from_disk():
+        """ Load stats saved in JSON format
+
+        :return: stats dict
+        """
+        try:
+            path = os.path.join("resources", "save_game.json")
+            with open(path) as saved_file:
+                stats = json.load(saved_file)
+        except (IOError, ValueError):
+            stats = None
 
         return stats
 
@@ -146,40 +223,6 @@ class Control(object):
         stats = self.read_games_stats_from_disk()
         return self.create_persist_from_stats(stats)
 
-    def start_state(self, state_name, persist=None):
-        """ Start a state
-
-        New stats will be created if there are none.
-
-        :param state_name: name of state to start
-        :param persist: dictionary of data for state
-        :return: None
-        """
-        if persist is None:
-            persist = self.create_new_persist()
-
-        try:
-            state = self.state_dict[state_name]
-        except KeyError:
-            print('Cannot find state: {}'.format(state_name))
-            raise RuntimeError
-
-        instance = state()
-        instance.controller = self
-        instance.startup(self.now, persist)
-
-        self.state = instance
-        self.state_name = state_name
-
-    def query_all_states(self):
-        """ Return a dictionary of all loaded states
-
-        Keys are state names, values are State classes
-
-        :return: dictionary of all loaded states
-        """
-        return self.state_dict.copy()
-
     def update(self, dt):
         """
         Checks if a state is done or has called for a game quit.
@@ -191,7 +234,7 @@ class Control(object):
             self.done = True
         elif self.state.done:
             self.flip_state()
-        self.state.update(self.render_surf,self.keys,self.now,dt,self.scale)
+        self.state.update(self.render_surf, self.keys, self.now, dt, self.scale)
         if self.music_handler and self.state.use_music_handler:
             self.music_handler.update(self.scale)
             self.music_handler.draw(self.render_surf)
@@ -247,8 +290,8 @@ class Control(object):
             return
         res_index = self.resolutions.index(self.screen_rect.size)
         adjust = 1 if size > self.screen_rect.size else -1
-        if 0 <= res_index+adjust < len(self.resolutions):
-            new_size = self.resolutions[res_index+adjust]
+        if 0 <= res_index + adjust < len(self.resolutions):
+            new_size = self.resolutions[res_index + adjust]
         else:
             new_size = self.screen_rect.size
         self.screen = pg.display.set_mode(new_size, pg.RESIZABLE)
@@ -260,8 +303,8 @@ class Control(object):
         Reset the ratio of render size to window size.
         Used to make sure that mouse clicks are accurate on all resolutions.
         """
-        w_ratio = self.render_size[0]/float(self.screen_rect.w)
-        h_ratio = self.render_size[1]/float(self.screen_rect.h)
+        w_ratio = self.render_size[0] / float(self.screen_rect.w)
+        h_ratio = self.render_size[1] / float(self.screen_rect.h)
         self.scale = (w_ratio, h_ratio)
 
     def toggle_show_fps(self, key):
